@@ -213,6 +213,68 @@ class TDSConv2dBlock(nn.Module):
         return self.layer_norm(x)  # TNC
 
 
+class LSTMBlock(nn.Module):
+    """An LSTM block that processes temporal sequences.
+
+    Args:
+        num_features (int): Number of input features. For an input of shape
+            (T, N, num_features).
+        hidden_size (int): Number of features in the hidden state of the LSTM.
+            If not specified, defaults to num_features.
+        num_layers (int): Number of recurrent layers. (default: 1)
+        bidirectional (bool): If True, becomes a bidirectional LSTM. (default: False)
+        dropout (float): Dropout probability between LSTM layers if num_layers > 1.
+            (default: 0.0)
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        hidden_size: int | None = None,
+        num_layers: int = 1,
+        bidirectional: bool = False,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+
+        if hidden_size is None:
+            hidden_size = num_features
+
+        self.hidden_size = hidden_size
+        self.num_directions = 2 if bidirectional else 1
+
+        self.lstm = nn.LSTM(
+            input_size=num_features,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=False,
+            bidirectional=bidirectional,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+
+        # Project back to original feature size if needed
+        lstm_output_size = hidden_size * self.num_directions
+        if lstm_output_size != num_features:
+            self.projection = nn.Linear(lstm_output_size, num_features)
+        else:
+            self.projection = None
+
+        self.layer_norm = nn.LayerNorm(num_features)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        x, _ = self.lstm(inputs)  # (T, N, hidden_size * num_directions)
+
+        # Project back to original feature size if needed
+        if self.projection is not None:
+            x = self.projection(x)  # (T, N, num_features)
+
+        # Skip connection
+        x = x + inputs
+
+        # Layer norm
+        return self.layer_norm(x)  # (T, N, num_features)
+
+
 class TDSFullyConnectedBlock(nn.Module):
     """A fully connected block as per "Sequence-to-Sequence Speech
     Recognition with Time-Depth Separable Convolutions, Hannun et al"
@@ -238,6 +300,63 @@ class TDSFullyConnectedBlock(nn.Module):
         x = self.fc_block(x)
         x = x + inputs
         return self.layer_norm(x)  # TNC
+
+
+class CNNLSTMEncoder(nn.Module):
+    """A CNN+LSTM encoder that applies convolutional blocks followed by
+    LSTM layers for temporal sequence modeling.
+
+    Args:
+        num_features (int): ``num_features`` for an input of shape
+            (T, N, num_features).
+        block_channels (list): A list of integers indicating the number
+            of channels per `TDSConv2dBlock`.
+        kernel_width (int): The kernel size of the temporal convolutions.
+        lstm_hidden_size (int): Hidden size for the LSTM layer. If None,
+            defaults to num_features.
+        lstm_num_layers (int): Number of LSTM layers. (default: 1)
+        lstm_bidirectional (bool): Whether to use bidirectional LSTM. (default: False)
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        block_channels: Sequence[int] = (24, 24, 24),
+        kernel_width: int = 32,
+        lstm_hidden_size: int | None = None,
+        lstm_num_layers: int = 1,
+        lstm_bidirectional: bool = True,
+    ) -> None:
+        super().__init__()
+
+        # CNN blocks
+        assert len(block_channels) > 0
+        cnn_blocks: list[nn.Module] = []
+        for channels in block_channels:
+            assert (
+                num_features % channels == 0
+            ), "block_channels must evenly divide num_features"
+            cnn_blocks.append(
+                TDSConv2dBlock(channels, num_features // channels, kernel_width)
+            )
+        self.cnn_blocks = nn.Sequential(*cnn_blocks)
+
+        # LSTM block
+        self.lstm_block = LSTMBlock(
+            num_features=num_features,
+            hidden_size=lstm_hidden_size,
+            num_layers=lstm_num_layers,
+            bidirectional=lstm_bidirectional,
+        )
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        # CNN
+        x = self.cnn_blocks(inputs)  # (T, N, num_features)
+
+        # LSTM
+        x = self.lstm_block(x)  # (T, N, num_features)
+
+        return x
 
 
 class TDSConvEncoder(nn.Module):
