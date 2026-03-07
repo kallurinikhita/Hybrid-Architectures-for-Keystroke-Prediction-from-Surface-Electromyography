@@ -11,7 +11,8 @@ band_rotation:
 
 temporal_jitter:
   _target_: emg2qwerty.transforms.TemporalAlignmentJitter
-  max_offset: 120  # Max 60ms jitter for 2kHz EMG
+  # max_offset: 120  # Max 60ms jitter for 2kHz EMG
+  max_offset: 60
 
 logspec:
   _target_: emg2qwerty.transforms.LogSpectrogram
@@ -20,10 +21,14 @@ logspec:
 
 specaug:
   _target_: emg2qwerty.transforms.SpecAugment
+  # n_time_masks: 3
   n_time_masks: 3
-  time_mask_param: 25  # Max 200ms per time mask for 125Hz spectrogram
+  # time_mask_param: 25  # Max 200ms per time mask for 125Hz spectrogram
+  time_mask_param: 15
+  # n_freq_masks: 2
   n_freq_masks: 2
-  freq_mask_param: 4
+  # freq_mask_param: 4
+  freq_mask_param: 3
 
 transforms:
   train:

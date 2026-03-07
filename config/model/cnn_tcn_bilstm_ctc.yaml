@@ -1,0 +1,16 @@
+# @package _global_
+
+module:
+  _target_: emg2qwerty.lightning.CNNTCNBiLSTMCTCModule
+  in_features: 528
+  mlp_features: [256]
+  cnn_channels: 128
+  cnn_kernel: 5
+  tcn_channels: [128, 128, 128]
+  tcn_kernel_width: 3
+  lstm_hidden: 128
+  lstm_layers: 1
+  dropout: 0.1
+  optimizer:
+    _target_: torch.optim.Adam
+    lr: 0.0001

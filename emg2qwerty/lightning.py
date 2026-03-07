@@ -6,7 +6,7 @@
 
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Sequence
 
 import numpy as np
 import pytorch_lightning as pl
@@ -16,7 +16,6 @@ from omegaconf import DictConfig
 from torch import nn
 from torch.utils.data import ConcatDataset, DataLoader
 from torchmetrics import MetricCollection
-
 from emg2qwerty import utils
 from emg2qwerty.charset import charset
 from emg2qwerty.data import LabelData, WindowedEMGDataset
@@ -27,7 +26,6 @@ from emg2qwerty.modules import (
     TDSConvEncoder,
 )
 from emg2qwerty.transforms import Transform
-
 
 class WindowedEMGDataModule(pl.LightningDataModule):
     def __init__(
@@ -107,7 +105,7 @@ class WindowedEMGDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             collate_fn=WindowedEMGDataset.collate,
             pin_memory=True,
-            persistent_workers=True,
+            persistent_workers=self.num_workers > 0,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -118,7 +116,7 @@ class WindowedEMGDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             collate_fn=WindowedEMGDataset.collate,
             pin_memory=True,
-            persistent_workers=True,
+            persistent_workers=self.num_workers > 0,
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -133,9 +131,8 @@ class WindowedEMGDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             collate_fn=WindowedEMGDataset.collate,
             pin_memory=True,
-            persistent_workers=True,
+            persistent_workers=self.num_workers > 0,
         )
-
 
 class TDSConvCTCModule(pl.LightningModule):
     NUM_BANDS: ClassVar[int] = 2
@@ -212,8 +209,14 @@ class TDSConvCTCModule(pl.LightningModule):
         # temporal receptive field to compute output activation lengths for CTCLoss.
         # NOTE: This assumes the encoder doesn't perform any temporal downsampling
         # such as by striding.
-        T_diff = inputs.shape[0] - emissions.shape[0]
+        T = emissions.shape[0]
         emission_lengths = input_lengths - T_diff
+        emission_lengths = emission_lengths.clamp(min=1, max=T).to(torch.long)
+
+        # (optional but highly recommended during debug)
+        assert (emission_lengths >= 1).all(), (emission_lengths.min(), emission_lengths.max(), T)
+        assert (emission_lengths <= T).all(), (emission_lengths.min(), emission_lengths.max(), T)
+        assert (target_lengths > 0).all()
 
         loss = self.ctc_loss(
             log_probs=emissions,  # (T, N, num_classes)
@@ -269,20 +272,109 @@ class TDSConvCTCModule(pl.LightningModule):
             optimizer_config=self.hparams.optimizer,
             lr_scheduler_config=self.hparams.lr_scheduler,
         )
-class CNNTransformerBiLSTMCTCModule(pl.LightningModule):
+    
+class Chomp1d(nn.Module):
+    def __init__(self, chomp_size: int) -> None:
+        super().__init__()
+        self.chomp_size = chomp_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.chomp_size == 0:
+            return x
+        return x[:, :, :-self.chomp_size]
+
+
+class TemporalBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        dilation: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+
+        padding = (kernel_size - 1) * dilation
+
+        self.net = nn.Sequential(
+            nn.Conv1d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                padding=padding,
+                dilation=dilation,
+            ),
+            Chomp1d(padding),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(
+                out_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                padding=padding,
+                dilation=dilation,
+            ),
+            Chomp1d(padding),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+
+        self.downsample = (
+            nn.Conv1d(in_channels, out_channels, kernel_size=1)
+            if in_channels != out_channels
+            else None
+        )
+        self.relu = nn.ReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.net(x)
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+
+class TCNEncoder(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        channels: Sequence[int],
+        kernel_size: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+
+        layers = []
+        for i, out_channels in enumerate(channels):
+            dilation = 2 ** i
+            curr_in = in_channels if i == 0 else channels[i - 1]
+            layers.append(
+                TemporalBlock(
+                    in_channels=curr_in,
+                    out_channels=out_channels,
+                    kernel_size=kernel_size,
+                    dilation=dilation,
+                    dropout=dropout,
+                )
+            )
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.network(x)
+
+class CNNTCNBiLSTMCTCModule(pl.LightningModule):
     NUM_BANDS: ClassVar[int] = 2
     ELECTRODE_CHANNELS: ClassVar[int] = 16
 
     def __init__(
         self,
-        in_features: int,              # same meaning as before (per-band flattened spectrogram features)
-        mlp_features: Sequence[int],   # optional: keep the MLP front-end
-        cnn_channels: int,             # e.g. 256
-        cnn_kernel: int,               # e.g. 5
-        num_transformer_layers: int,   # e.g. 4
-        num_heads: int,                # e.g. 4 or 8
-        lstm_hidden: int,              # e.g. 256
-        lstm_layers: int,              # e.g. 2
+        in_features: int,
+        mlp_features: Sequence[int],
+        cnn_channels: int,
+        cnn_kernel: int,
+        tcn_channels: Sequence[int],
+        tcn_kernel_width: int,
+        lstm_hidden: int,
+        lstm_layers: int,
         dropout: float,
         optimizer: DictConfig,
         lr_scheduler: DictConfig,
@@ -291,7 +383,6 @@ class CNNTransformerBiLSTMCTCModule(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        # ----- Front-end: same as baseline (good starter) -----
         num_features = self.NUM_BANDS * mlp_features[-1]
 
         self.frontend = nn.Sequential(
@@ -304,38 +395,31 @@ class CNNTransformerBiLSTMCTCModule(pl.LightningModule):
             nn.Flatten(start_dim=2),  # (T, N, num_features)
         )
 
-        # ----- CNN/TCN over time (operate on T,N,C) -----
-        # Conv1d expects (N, C, T), so we transpose in forward.
+        pad = cnn_kernel // 2
         self.cnn = nn.Sequential(
-            nn.Conv1d(num_features, cnn_channels, kernel_size=cnn_kernel, padding=cnn_kernel // 2),
+            nn.Conv1d(num_features, cnn_channels, kernel_size=cnn_kernel, padding=pad),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Conv1d(cnn_channels, cnn_channels, kernel_size=cnn_kernel, padding=cnn_kernel // 2),
+            nn.Conv1d(cnn_channels, cnn_channels, kernel_size=cnn_kernel, padding=pad),
             nn.ReLU(),
             nn.Dropout(dropout),
         )
 
-        # ----- Transformer encoder over time (expects T,N,E) -----
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=cnn_channels,
-            nhead=num_heads,
-            dim_feedforward=4 * cnn_channels,
+        self.tcn = TCNEncoder(
+            in_channels=cnn_channels,
+            channels=tcn_channels,
+            kernel_size=tcn_kernel_width,
             dropout=dropout,
-            batch_first=False,
-            activation="relu",
         )
-        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=num_transformer_layers)
 
-        # ----- BiLSTM over time -----
         self.bilstm = nn.LSTM(
-            input_size=cnn_channels,
+            input_size=tcn_channels[-1],
             hidden_size=lstm_hidden,
             num_layers=lstm_layers,
             dropout=dropout if lstm_layers > 1 else 0.0,
             bidirectional=True,
         )
 
-        # ----- Linear -> classes -> logsoftmax for CTC -----
         self.classifier = nn.Sequential(
             nn.Linear(2 * lstm_hidden, charset().num_classes),
             nn.LogSoftmax(dim=-1),
@@ -346,45 +430,61 @@ class CNNTransformerBiLSTMCTCModule(pl.LightningModule):
 
         metrics = MetricCollection([CharacterErrorRates()])
         self.metrics = nn.ModuleDict(
-            {f"{phase}_metrics": metrics.clone(prefix=f"{phase}/") for phase in ["train", "val", "test"]}
+            {
+                f"{phase}_metrics": metrics.clone(prefix=f"{phase}/")
+                for phase in ["train", "val", "test"]
+            }
         )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        x = self.frontend(inputs)          # (T, N, num_features)
+        x = self.frontend(inputs)      # (T, N, F)
+        x = x.permute(1, 2, 0)         # (N, F, T)
+        x = self.cnn(x)                # (N, C, T)
+        x = self.tcn(x)                # (N, C_tcn, T)
+        x = x.permute(2, 0, 1)         # (T, N, C_tcn)
+        x, _ = self.bilstm(x)          # (T, N, 2H)
+        return self.classifier(x)      # (T, N, classes)
 
-        # CNN over time
-        x = x.permute(1, 2, 0)             # (N, C, T)
-        x = self.cnn(x)                    # (N, cnn_channels, T)
-        x = x.permute(2, 0, 1)             # (T, N, cnn_channels)
-
-        # Transformer
-        x = self.transformer(x)            # (T, N, cnn_channels)
-
-        # BiLSTM
-        x, _ = self.bilstm(x)              # (T, N, 2*lstm_hidden)
-
-        # Classifier
-        return self.classifier(x)          # (T, N, num_classes)
-
-    # reuse the exact same _step / epoch_end / configure_optimizers from TDSConvCTCModule
-    def _step(self, phase: str, batch: dict[str, torch.Tensor], *args, **kwargs) -> torch.Tensor:
+    def _step(
+        self, phase: str, batch: dict[str, torch.Tensor], *args, **kwargs
+    ) -> torch.Tensor:
         inputs = batch["inputs"]
         targets = batch["targets"]
         input_lengths = batch["input_lengths"]
         target_lengths = batch["target_lengths"]
         N = len(input_lengths)
 
-        emissions = self.forward(inputs)
+        emissions = self.forward(inputs)   # already log_probs
+        T = emissions.shape[0]
 
-        # NOTE: this model uses padding='same' convs -> no time shrink, so:
-        emission_lengths = input_lengths
+        T_diff = inputs.shape[0] - T
+        emission_lengths = (input_lengths - T_diff).clamp(min=1, max=T).long()
 
-        loss = self.ctc_loss(
-            log_probs=emissions,
-            targets=targets.transpose(0, 1),
-            input_lengths=emission_lengths,
-            target_lengths=target_lengths,
-        )
+        valid_mask = target_lengths > 0
+
+        if valid_mask.any():
+            idx = valid_mask.nonzero(as_tuple=True)[0]
+            emissions_valid = emissions[:, idx, :]
+            targets_valid = targets[:, idx].transpose(0, 1).long()
+            emission_lengths_valid = emission_lengths[idx]
+            target_lengths_valid = target_lengths[idx].long()
+
+            if emissions_valid.device.type == "mps":
+                loss = self.ctc_loss(
+                    emissions_valid.cpu(),
+                    targets_valid.cpu(),
+                    emission_lengths_valid.cpu(),
+                    target_lengths_valid.cpu(),
+                ).to(emissions_valid.device)
+            else:
+                loss = self.ctc_loss(
+                    emissions_valid,
+                    targets_valid,
+                    emission_lengths_valid,
+                    target_lengths_valid,
+                )
+        else:
+            loss = emissions.sum() * 0.0
 
         predictions = self.decoder.decode_batch(
             emissions=emissions.detach().cpu().numpy(),
@@ -395,6 +495,8 @@ class CNNTransformerBiLSTMCTCModule(pl.LightningModule):
         targets_np = targets.detach().cpu().numpy()
         target_lengths_np = target_lengths.detach().cpu().numpy()
         for i in range(N):
+            if target_lengths_np[i] == 0:
+                continue
             target = LabelData.from_labels(targets_np[: target_lengths_np[i], i])
             metrics.update(prediction=predictions[i], target=target)
 
@@ -406,12 +508,23 @@ class CNNTransformerBiLSTMCTCModule(pl.LightningModule):
         self.log_dict(metrics.compute(), sync_dist=True)
         metrics.reset()
 
-    def training_step(self, *args, **kwargs): return self._step("train", *args, **kwargs)
-    def validation_step(self, *args, **kwargs): return self._step("val", *args, **kwargs)
-    def test_step(self, *args, **kwargs): return self._step("test", *args, **kwargs)
-    def on_train_epoch_end(self): self._epoch_end("train")
-    def on_validation_epoch_end(self): self._epoch_end("val")
-    def on_test_epoch_end(self): self._epoch_end("test")
+    def training_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("train", *args, **kwargs)
+
+    def validation_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("val", *args, **kwargs)
+
+    def test_step(self, *args, **kwargs) -> torch.Tensor:
+        return self._step("test", *args, **kwargs)
+
+    def on_train_epoch_end(self) -> None:
+        self._epoch_end("train")
+
+    def on_validation_epoch_end(self) -> None:
+        self._epoch_end("val")
+
+    def on_test_epoch_end(self) -> None:
+        self._epoch_end("test")
 
     def configure_optimizers(self) -> dict[str, Any]:
         return utils.instantiate_optimizer_and_scheduler(
@@ -419,3 +532,4 @@ class CNNTransformerBiLSTMCTCModule(pl.LightningModule):
             optimizer_config=self.hparams.optimizer,
             lr_scheduler_config=self.hparams.lr_scheduler,
         )
+    

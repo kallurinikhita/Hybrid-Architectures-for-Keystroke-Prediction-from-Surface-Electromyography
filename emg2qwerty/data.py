@@ -541,3 +541,4 @@ class WindowedEMGDataset(torch.utils.data.Dataset):
             "input_lengths": input_lengths,
             "target_lengths": target_lengths,
         }
+    

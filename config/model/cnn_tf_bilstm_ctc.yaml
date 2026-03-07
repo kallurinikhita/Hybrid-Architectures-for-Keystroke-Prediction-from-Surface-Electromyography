@@ -6,10 +6,13 @@ module:
 
   cnn_channels: 256
   cnn_kernel: 5
+
   num_transformer_layers: 4
   num_heads: 4
+
   lstm_hidden: 256
   lstm_layers: 2
+
   dropout: 0.1
 
 datamodule:
