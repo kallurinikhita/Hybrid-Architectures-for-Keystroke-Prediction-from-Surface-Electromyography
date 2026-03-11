@@ -24,7 +24,9 @@ from emg2qwerty.modules import (
     MultiBandRotationInvariantMLP,
     SpectrogramNorm,
     TDSConvEncoder,
+    Chomp1d,
     CNNLSTMEncoder,
+    TCNEncoder,
 )
 from emg2qwerty.transforms import Transform
 
@@ -280,15 +282,6 @@ class TDSConvCTCModule(pl.LightningModule):
             lr_scheduler_config=self.hparams.lr_scheduler,
         )
     
-class Chomp1d(nn.Module):
-    def __init__(self, chomp_size: int) -> None:
-        super().__init__()
-        self.chomp_size = chomp_size
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.chomp_size == 0:
-            return x
-        return x[:, :, :-self.chomp_size]
 
 
 class TemporalBlock(nn.Module):
@@ -338,6 +331,7 @@ class TemporalBlock(nn.Module):
         out = self.net(x)
         res = x if self.downsample is None else self.downsample(x)
         return self.relu(out + res)
+<<<<<<< HEAD
 
 
 class TCNEncoder(nn.Module):
@@ -368,6 +362,9 @@ class TCNEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.network(x)
 
+=======
+    
+>>>>>>> faab071 (Updated lightning module)
 class CNNTCNBiLSTMCTCModule(pl.LightningModule):
     NUM_BANDS: ClassVar[int] = 2
     ELECTRODE_CHANNELS: ClassVar[int] = 16
@@ -539,4 +536,3 @@ class CNNTCNBiLSTMCTCModule(pl.LightningModule):
             optimizer_config=self.hparams.optimizer,
             lr_scheduler_config=self.hparams.lr_scheduler,
         )
-    
