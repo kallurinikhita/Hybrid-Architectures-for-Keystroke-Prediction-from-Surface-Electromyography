@@ -326,6 +326,8 @@ class CNNLSTMEncoder(nn.Module):
         lstm_hidden_size: int | None = None,
         lstm_num_layers: int = 1,
         lstm_bidirectional: bool = True,
+        lstm_dropout: float = 0.0,
+        cnn_dropout: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -339,6 +341,8 @@ class CNNLSTMEncoder(nn.Module):
             cnn_blocks.append(
                 TDSConv2dBlock(channels, num_features // channels, kernel_width)
             )
+            if cnn_dropout > 0.0:
+                cnn_blocks.append(nn.Dropout(cnn_dropout))
         self.cnn_blocks = nn.Sequential(*cnn_blocks)
 
         # LSTM block
@@ -347,6 +351,7 @@ class CNNLSTMEncoder(nn.Module):
             hidden_size=lstm_hidden_size,
             num_layers=lstm_num_layers,
             bidirectional=lstm_bidirectional,
+            dropout=lstm_dropout,
         )
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
