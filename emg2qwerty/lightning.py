@@ -157,6 +157,8 @@ class FinalModule(pl.LightningModule):
         lstm_hidden_size: int | None = None,
         lstm_num_layers: int = 1,
         lstm_bidirectional: bool = True,
+        lstm_dropout: float = 0.0,
+        cnn_dropout: float = 0.0,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -183,6 +185,8 @@ class FinalModule(pl.LightningModule):
                 lstm_hidden_size=lstm_hidden_size,
                 lstm_num_layers=lstm_num_layers,
                 lstm_bidirectional=lstm_bidirectional,
+                lstm_dropout= 0.0,
+                cnn_dropout= 0.0,
             ),
             # (T, N, num_classes)
             nn.Linear(num_features, charset().num_classes),
