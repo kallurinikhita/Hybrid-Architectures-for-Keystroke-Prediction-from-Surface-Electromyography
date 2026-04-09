@@ -1,6 +1,5 @@
 # Hybrid CNN Architectures for Keystroke Prediction from Surface Electromyography
 
-CS247A Final Project – Winter 2026  
 Emma Thorssell, Gavin McKim, Nikhita Kalluri, Madison Sarmiento
 
 ## Overview
